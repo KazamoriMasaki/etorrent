@@ -13,8 +13,10 @@ http://manpages.ubuntu.com/manpages/bionic/man1/bttrack.bittornado.1.html
 #+begin_src bash
 mkdir .bttrack
 mkdir btfiles
-bttrack --port 6969 --dfile .bttrack/dstate --logfile .bttrack/tracker.log --nat_check 0 --scrape_allowed full --parse_dir_interval 10 --allow_get 1 
+bttrack --port 6969 --dfile .bttrack/dstate --logfile .bttrack/tracker.log --nat_check 0 --scrape_allowed full --parse_dir_interval 10 --allow_get 1 --compact_reqd 0
 #+end_src
+
+Be noticed that, adding option --compact_reqd 0 to allow older client to talk to tracker.
 *** test tracker works or not
 #+begin_src bash
 firefox http://localhost:6969
@@ -25,5 +27,5 @@ sudo apt-get install bittornado
 btmakemetafile  http://localhost:6969/announce test/test.pdf --target test/test.torrent
 #+end_src
 ** Starting a regular transmission client
-   Open that ~test.torrent~ in transmission client.
+   Open that ~test.torrent~ in *qBittorrent* client, specify the download location to where the seeding file already resides, then it will start seeding on localhost.
 
