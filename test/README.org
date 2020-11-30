@@ -1,0 +1,29 @@
+#+TITLE etorrent-test
+* Required
+** bttrack
+*** install
+#+begin_src bash
+sudo apt-get install bittornado
+#+end_src
+*** manpage
+http://manpages.ubuntu.com/manpages/bionic/man1/bttrack.bittornado.1.html
+** transmission
+* Procedure
+** Running a Torrent tracker on localhost
+#+begin_src bash
+mkdir .bttrack
+mkdir btfiles
+bttrack --port 6969 --dfile .bttrack/dstate --logfile .bttrack/tracker.log --nat_check 0 --scrape_allowed full --parse_dir_interval 10 --allow_get 1 
+#+end_src
+*** test tracker works or not
+#+begin_src bash
+firefox http://localhost:6969
+#+end_src
+** Creating a Torrent file for test
+#+begin_src bash
+sudo apt-get install bittornado
+btmakemetafile  http://localhost:6969/announce test/test.pdf --target test/test.torrent
+#+end_src
+** Starting a regular transmission client
+   Open that ~test.torrent~ in transmission client.
+
