@@ -191,7 +191,6 @@
 	 (port "48738") 
 	 (uploaded  "0")
 	 (downloaded "0")
-	 (compact "1")
 	 (left "100")
 	 (url (concat  base
 		       (if (string-match-p "?" base) "&" "?")
@@ -200,6 +199,7 @@
 		       "port=" port "&"
 		       "uploaded=" uploaded "&"
 		       "downloaded=" downloaded "&"
+		       "compact=0" "&"
 		       "left=" left))
 	 (url-request-method "GET")
 	 (url-user-agent "uTorrent/2040(22967)"))
@@ -451,6 +451,7 @@
   (gen-range 0 (- piece-length 1) block-length))
 
 (defun download-torrent (metainfo)
+  ; (etorrent-log (format "Start downloading %s" (prin1-to-string metainfo)))
   (let ((tracker-rsp (build-tracker-url metainfo))
 	(info-hash (sha1
 		    (dump-value-to-bencode 
@@ -458,6 +459,7 @@
 		    nil nil t))
 	(peer-id "-UT2040-qnmlgbqnmlgb") ; peer-id 伪装成utorrent,代号为去年买了个表
 	(port "9527"))
+    (etorrent-log (format "Start to download, tracker response object: %s" (prin1-to-string tracker-rsp)))
     (let* ((peer-list (gethash "peers" tracker-rsp))
 	   (handshake-message (build-handshake info-hash peer-id))
 	   (file-length (gethash "length" (gethash "info" metainfo)))
@@ -467,18 +469,41 @@
 	   (n-pieces (ceiling file-length piece-length))
 	   (n-blocks (ceiling piece-length block-length)))
 
-      (defun try-make-network (peer-list)
-	(if peer-list
+
+      (defun split-string-by-size (str size)
+	(if (= (length str) 0)
+	    '()
+	  (if (< (length str) size)
+	      (list str)
+	    (cons (substring str 0 size) (split-string-by-size (substring str size nil) size)))))
+
+      (defun parse-string-peers (peers)
+	(when (mod (length peers) 6)
+	  (let ((peer-list (split-string-by-size peers 6)))
+	    (mapcar 
+	     (lambda (peer-data)
+	       (let ((peer (make-hash-table :test 'equal)))
+		 (puthash "ip" (bindat-ip-to-string (substring peer-data 0 4)) peer)
+		 (puthash "port" (bindat-get-field (bindat-unpack '((:port u16)) (substring peer-data 4 nil)) :port) peer)
+		 peer))
+	     peer-list))))
+
+      (defun try-make-network (peers)
+	(etorrent-log (format "peers %s" (prin1-to-string peers)))
+	(when (stringp peers)
+	  (setq peers (parse-string-peers peers)))
+	(etorrent-log (format "peers %s" (prin1-to-string peers)))
+	(if peers
 	    (condition-case nil
-		(let ((proc (make-network-process :name (concat info-hash "-" (gethash "ip" (car peer-list)))
-						  :host (gethash "ip" (car peer-list))
-						  :service (gethash "port" (car peer-list))
+		(let ((proc (make-network-process :name (concat info-hash "-" (gethash "ip" (car peers)))
+						  :host (gethash "ip" (car peers))
+						  :service (gethash "port" (car peers))
 						  :filter 'peer-message-handler
 						  :no-wait nil)))
 		  proc)
 	      ('error
-	       (etorrent-log (format "Connected to %s failed." (car peer-list)))
-	       (try-make-network (cdr peer-list))))))
+	       (etorrent-log (format "Connected to %s failed." (car peers)))
+	       (try-make-network (cdr peers))))))
 
       (let ((proc (try-make-network peer-list))
 	    (download-attribute (make-hash-table :test 'equal)))
