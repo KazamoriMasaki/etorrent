@@ -224,7 +224,7 @@
 
 (defconst message-spec
   '((:length u32)
-    (:message strz (:length))))
+    (:message str (:length))))
 
 (defconst peer-message-spec
   '((:length  u32)
@@ -291,25 +291,26 @@
     (etorrent-log (format "needed index %d begin %d" index begin))
     (aref
      (aref (etorrent-process-get proc ":received") index)
-     (/ begin (etorrent-process-get proc ":piece-length")))))
+     (/ begin (etorrent-process-get proc ":block-length")))))
 
 (defun request-piece (proc)
   "let us build the queue in the lisp way."
   (let* ((queue (etorrent-process-get proc ":queue"))
 	 (requested (etorrent-process-get proc ":requested"))
 	 (piece-block (car queue)))
-    (etorrent-log (format "request-piece, queue %s, piece-block %s"
-		   (prin1-to-string queue)
-		   (prin1-to-string piece-block)))
-    (if (needed proc piece-block)
+    (when piece-block
+      (etorrent-log (format "request-piece, queue %s, piece-block %s"
+			    (prin1-to-string queue)
+			    (prin1-to-string piece-block)))
+      (if (needed proc piece-block)
+	  (progn
+	    (etorrent-process-put proc ":queue" (cdr queue))
+	    (request-piece proc))
 	(progn
-	  (etorrent-process-put proc ":queue" (cdr queue))
-	  (request-piece proc))
-      (progn
-	(etorrent-process-put proc ":piece-blocks" (push piece-block piece-blocks))
-	(let ((request-message (apply 'build-request piece-block)))
-	  (etorrent-log (format "Request message %s" request-message))
-	  (process-send-string proc request-message))))))
+	  (add-requested proc (car piece-block) (cadr piece-block))
+	  (let ((request-message (apply 'build-request piece-block)))
+	    (etorrent-log (format "Request message %s" request-message))
+	    (process-send-string proc request-message)))))))
 
 (defun choke-handler (proc)
   (delete-process proc))
@@ -320,7 +321,7 @@
 (defun enque-piece (proc piece-index)
   (let ((queue (etorrent-process-get proc ":queue"))
 	(block (etorrent-process-get proc ":block")))
-    (etorrent-log (format "enque-piece %s block %s" (prin1-to-string queue) (prin1-to-string block)))
+    ; (etorrent-log (format "enque-piece %s block %s" (prin1-to-string queue) (prin1-to-string block)))
     (setq queue
 	  (nconc
 	   (mapcar 
@@ -328,13 +329,13 @@
 	      (push piece-index v))
 	    block) 
 	   queue))
-    (etorrent-log (format "enque-piece %s" (prin1-to-string queue)))
+    ; (etorrent-log (format "enque-piece %s" (prin1-to-string queue)))
     (etorrent-process-put proc ":queue" queue)))
 
 (defun have-handler (proc payload)
   (etorrent-log (format "Have handler, payload %s" payload))
   (let ((piece-index (bindat-get-field
-		      (bindat-unpack '((:piece-index)) 
+		      (bindat-unpack '((:piece-index u32)) 
 				     payload)
 		      :piece-index)))
     (enque-piece proc piece-index)
@@ -346,47 +347,56 @@
     (let ((byte (aref payload i)))
       (dotimes (j 8)
 	(let ((mask (lsh 1 7)))
-	  (if (logand (lsh byte j) mask)
+	  (if (> (logand (lsh byte j) mask) 0)
 	      (enque-piece proc (+ (* i 8) j)))))))
+  (etorrent-log (format "After handling bitfield, queue is %s" (etorrent-process-get proc ":queue")))
   (request-piece proc))
 
 (defun add-received (proc index begin)
+  (etorrent-log (format "Add received index %d begin %d" index begin))
   (setf (aref
 	 (aref (etorrent-process-get proc ":received") index)
-	 (/ begin (etorrent-process-get proc ":piece-length")))
+	 (/ begin (etorrent-process-get proc ":block-length")))
+	t))
+
+(defun add-requested (proc index begin)
+  (setf (aref
+	 (aref (etorrent-process-get proc ":requested") index)
+	 (/ begin (etorrent-process-get proc ":block-length")))
 	t))
 
 ; Ref: https://emacs.stackexchange.com/questions/19018/what-emacs-lisp-boolean-logical-convenience-functions-exist
 (defun bool-vector-all-p (bool-vector)
-  (null (memq nil (bool-vector))))
+  (= (bool-vector-count-population bool-vector) (length bool-vector)))
 
 (defun piece-done-p (proc index)
   (bool-vector-all-p (aref (etorrent-process-get proc ":received"))))
 
 (defun download-done-p (proc)
+  (etorrent-log (format "Received count is %s" (mapcar 'vconcat (etorrent-process-get proc ":received"))))
   (seq-every-p 'bool-vector-all-p (etorrent-process-get proc ":received")))
 
 (defun piece-handler (proc payload)
-  (let *((piece-payload-struct (bindat-unpack '((:index u32)
-						(:begin u32)
-						(:data strz (- (length payload) 8)))
-					      payload))
-	 (index (bindat-get-field piece-payload-struct :index))
-	 (begin (bindat-get-field piece-payload-struct :begin))
-	 (data (bindat-get-field piece-payload-struct :data))
-	 (file-buffer (etorrent-process-get proc ":file-buffer"))
-	 (file-length (etorrent-process-get proc ":file-length"))
-	 (piece-length (etorrent-process-get proc ":piece-length")))
-       (with-current-buffer file-buffer
-	 (setf (point) (+ (* index piece-length) begin))
-	 (insert data))
-       (add-received proc index begin)
-       (if (download-done-p proc)
-	   (progn 
-	     (with-current-buffer file-buffer
-	       (write-region (point-min) (point-max) (process-get proc :file-name)))
-	     (delete-process proc))
-	 (request-piece proc))))
+  (let ((index (bindat-get-field (bindat-unpack '((:index u32)) (substring payload 0 4)) :index))
+	(begin (bindat-get-field (bindat-unpack '((:begin u32)) (substring payload 4 8)) :begin))
+	(data (substring payload 8 nil))
+	(file-buffer (etorrent-process-get proc ":file-buffer"))
+	(file-length (etorrent-process-get proc ":file-length"))
+	(piece-length (etorrent-process-get proc ":piece-length")))
+    (let ((coding-system-for-write 'no-conversion))
+      (with-current-buffer file-buffer
+	(set-buffer-multibyte nil)
+	(set-buffer-file-coding-system 'raw-text)
+	(setf (point) (+ (* index piece-length) begin))
+	(seq-doseq (char data)
+	  (insert char))
+	(add-received proc index begin)
+	(if (download-done-p proc)
+	    (progn 
+	      (etorrent-log "Download compelete!")
+	      (write-region nil nil (etorrent-process-get proc ":file-name"))
+	      (delete-process proc))
+	  (request-piece proc))))))
 
 (defun handshake-p (msg)
   "test whether message is a handshake message or not."
@@ -406,34 +416,37 @@
 ;; Ref: https://allenkim67.github.io/programming/2016/05/04/how-to-make-your-own-bittorrent-client.html#handling-messages
 (defun peer-message-handler (proc msg)
   "Handle network message."
-  (etorrent-log (format "Got message. Length: %d .%s" (length msg) msg)) 
+  ; (etorrent-log (format "Got message. Length: %d .%s" (length msg) msg)) 
   (with-current-buffer (get-buffer-create "etorrent-network-log")
+    (set-buffer-multibyte nil)
     (setf (point) (point-max))
     (insert msg)
-    (when (handshake-p msg)
-      (etorrent-log "Got handshake.")
-      (delete-region (point-min) 69)
-      (process-send-string proc (build-interested)))
-    (etorrent-log "Start parsing")
-    (let ((message-length (parse-peer-message-length)))
-      (etorrent-log (format "Message-length %d buffer size %d" message-length (buffer-size)))
-      (while (and (> (buffer-size) 0)
-		  (>= (buffer-size) (+ message-length 4)))
-	(etorrent-log "enter loop")
-	(let ((buffer-content (buffer-substring-no-properties 5 (+ message-length 5))))
-	  (delete-region (point-min) (+ message-length 5))
-	  (etorrent-log (format "After delete buffer-size %d" (buffer-size)))
-	  (if (not (string= "" buffer-content))
-	      (let ((id (aref buffer-content 0))
-		    (payload (string-to-unibyte (substring-no-properties buffer-content 1 nil))))
-		(etorrent-log (format "mwssage id %d" id))
-		(cond 
-		 ((= id 0) (choke-handler proc))
-		 ((= id 1) (unchoke-handler proc))
-		 ((= id 4) (have-handler proc payload))
-		 ((= id 5) (bitfield-handler proc payload))
-		 ((= id 7) (piece-handler proc payload)))))
-	    (setq message-length (parse-message-length)))))))
+    (if (handshake-p msg)
+	(progn
+	  (etorrent-log "Got handshake.")
+	  (delete-region (point-min) 69)
+	  (process-send-string proc (build-interested)))
+      (progn
+	(etorrent-log "Start parsing")
+	(let ((message-length (parse-peer-message-length)))
+	  (etorrent-log (format "Message-length %d buffer size %d" message-length (buffer-size)))
+	  (while (and (> (buffer-size) 0)
+		      (>= (buffer-size) (+ message-length 4)))
+	    (etorrent-log "enter loop")
+	    (let ((buffer-content (buffer-substring-no-properties 5 (+ message-length 5))))
+	      (delete-region (point-min) (+ message-length 5))
+	      (etorrent-log (format "After delete buffer-size %d" (buffer-size)))
+	      (if (not (string= "" buffer-content))
+		  (let ((id (aref buffer-content 0))
+			(payload (substring-no-properties buffer-content 1 nil)))
+		    (etorrent-log (format "mwssage id %d" id))
+		    (cond 
+		     ((= id 0) (choke-handler proc))
+		     ((= id 1) (unchoke-handler proc))
+		     ((= id 4) (have-handler proc payload))
+		     ((= id 5) (bitfield-handler proc payload))
+		     ((= id 7) (piece-handler proc payload)))))
+	      (setq message-length (parse-peer-message-length)))))))))
 
 (defun etorrent-log (msg) 
   (let ((message-buffer (get-buffer-create "etorrent-log")))
@@ -448,7 +461,7 @@
       (cons (list start step) (gen-range (+ start step) end step)))))
 
 (defun split-pieces (piece-length block-length)
-  (gen-range 0 (- piece-length 1) block-length))
+  (gen-range 0 (- piece-length 1) (- block-length 1)))
 
 (defun download-torrent (metainfo)
   ; (etorrent-log (format "Start downloading %s" (prin1-to-string metainfo)))
@@ -469,7 +482,12 @@
 	   (n-pieces (ceiling file-length piece-length))
 	   (n-blocks (ceiling piece-length block-length)))
 
-
+      (etorrent-log (format
+		     "Downloading torrent traits -- file-length: %d -- piece-length: %d 
+                                                 -- block-length: %d -- n-pieces: %d --
+                                                 -- n-blocks: %d"
+		     file-length piece-length block-length n-pieces n-blocks))
+                                                 
       (defun split-string-by-size (str size)
 	(if (= (length str) 0)
 	    '()
@@ -498,6 +516,7 @@
 		(let ((proc (make-network-process :name (concat info-hash "-" (gethash "ip" (car peers)))
 						  :host (gethash "ip" (car peers))
 						  :service (gethash "port" (car peers))
+						  :coding 'binary
 						  :filter 'peer-message-handler
 						  :no-wait nil)))
 		  proc)
