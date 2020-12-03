@@ -289,9 +289,8 @@
   (let ((index (car piece-block))
 	(begin (cadr piece-block)))
     (etorrent-log (format "needed index %d begin %d" index begin))
-    (aref
-     (aref (etorrent-process-get proc ":received") index)
-     (/ begin (etorrent-process-get proc ":block-length")))))
+    (aref (etorrent-process-get proc ":requested")
+	  (+ (* index (etorrent-process-get proc ":n-blocks")) (/ begin (etorrent-process-get proc ":block-length"))))))
 
 (defun request-piece (proc)
   "let us build the queue in the lisp way."
@@ -318,18 +317,28 @@
 (defun unchoke-handler (proc)
   (request-piece proc))
 
+(defun get-real-piece-length (file-size piece-length piece-index)
+  (let ((piece-end (* (+ piece-index 1) piece-length)))
+    (if (>= piece-end file-size)
+	(- file-size (* piece-index piece-length))
+      piece-length)))
+
 (defun enque-piece (proc piece-index)
   (let ((queue (etorrent-process-get proc ":queue"))
-	(block (etorrent-process-get proc ":block")))
+	(file-length (etorrent-process-get proc ":file-length"))
+	(piece-length (etorrent-process-get proc ":piece-length"))
+        (block-length (etorrent-process-get proc ":block-length")))
     ; (etorrent-log (format "enque-piece %s block %s" (prin1-to-string queue) (prin1-to-string block)))
-    (setq queue
-	  (nconc
-	   (mapcar 
-	    (lambda (v)
-	      (push piece-index v))
-	    block) 
-	   queue))
-    ; (etorrent-log (format "enque-piece %s" (prin1-to-string queue)))
+
+
+    (let ((real-piece-length (get-real-piece-length file-length piece-length piece-index)))
+      (setq queue
+	    (append queue
+		    (mapcar
+		     (lambda (v)
+		       (cons piece-index v))
+		     (split-pieces real-piece-length block-length)))))
+
     (etorrent-process-put proc ":queue" queue)))
 
 (defun have-handler (proc payload)
@@ -354,15 +363,13 @@
 
 (defun add-received (proc index begin)
   (etorrent-log (format "Add received index %d begin %d" index begin))
-  (setf (aref
-	 (aref (etorrent-process-get proc ":received") index)
-	 (/ begin (etorrent-process-get proc ":block-length")))
+  (aset (etorrent-process-get proc ":received")
+	(+ (* index (etorrent-process-get proc ":n-blocks")) (/ begin (etorrent-process-get proc ":block-length")))
 	t))
 
 (defun add-requested (proc index begin)
-  (setf (aref
-	 (aref (etorrent-process-get proc ":requested") index)
-	 (/ begin (etorrent-process-get proc ":block-length")))
+  (aset (etorrent-process-get proc ":requested")
+	(+ (* index (etorrent-process-get proc ":n-blocks")) (/ begin (etorrent-process-get proc ":block-length")))
 	t))
 
 ; Ref: https://emacs.stackexchange.com/questions/19018/what-emacs-lisp-boolean-logical-convenience-functions-exist
@@ -373,8 +380,9 @@
   (bool-vector-all-p (aref (etorrent-process-get proc ":received"))))
 
 (defun download-done-p (proc)
-  (etorrent-log (format "Received count is %s" (mapcar 'vconcat (etorrent-process-get proc ":received"))))
-  (seq-every-p 'bool-vector-all-p (etorrent-process-get proc ":received")))
+  (etorrent-log (format "Requested count is %s" (vconcat (etorrent-process-get proc ":requested"))))
+  (etorrent-log (format "Received count is %s" (vconcat (etorrent-process-get proc ":received"))))
+  (bool-vector-all-p (etorrent-process-get proc ":received")))
 
 (defun piece-handler (proc payload)
   (let ((index (bindat-get-field (bindat-unpack '((:index u32)) (substring payload 0 4)) :index))
@@ -388,8 +396,7 @@
 	(set-buffer-multibyte nil)
 	(set-buffer-file-coding-system 'raw-text)
 	(setf (point) (+ (* index piece-length) begin))
-	(seq-doseq (char data)
-	  (insert char))
+	(insert data)
 	(add-received proc index begin)
 	(if (download-done-p proc)
 	    (progn 
@@ -408,7 +415,7 @@
 ;; Ref: https://github.com/skeeto/emacs-web-server/blob/master/simple-httpd.el
 (defun parse-peer-message-length ()
   "Parse peer message length, an u32."
-  (if (= (buffer-size) 0)
+  (if (< (buffer-size) 4)
       0
     (let ((msg-len-raw-bytes (string-to-unibyte (buffer-substring-no-properties (point-min) 5))))
       (bindat-get-field (bindat-unpack '((:length u32)) msg-len-raw-bytes) :length))))
@@ -455,13 +462,40 @@
       (insert (format "[%s] %s\n" (format-time-string "%D %-I:%M %p") msg)))))
 
 (defun gen-range (start end step)
-  (let ((length (- end start)))
+  (let ((length (+ (- end start) 1)))
     (if (<= length step)
 	(list (list start length))
       (cons (list start step) (gen-range (+ start step) end step)))))
 
 (defun split-pieces (piece-length block-length)
-  (gen-range 0 (- piece-length 1) (- block-length 1)))
+  (gen-range 0 (- piece-length 1) block-length))
+
+(defun zip (xs ys)
+  (if (or (null xs) (null ys))
+      '()
+      (cons (cons (car xs) (car ys)) (zip (cdr xs) (cdr ys)))))
+
+
+(defun create-blocks (file-length piece-length block-length)
+  (let ((pieces (split-pieces file-length piece-length)))
+    (mapcan 
+     (lambda (piece)
+       (let ((piece-length (car (cdr (cdr piece))))
+	     (piece-index (car piece)))
+	 (mapcar 
+	  (lambda (v)
+	    (cons piece-index v))
+	  (split-pieces piece-length block-length))
+	 ))
+      (zip (number-sequence 0 (- (length pieces) 1)) pieces))))
+
+
+(defun fill-buffer (buffer length)
+  (with-current-buffer buffer
+    (set-buffer-multibyte nil)
+    (set-buffer-file-coding-system 'raw-text)
+    (setf (point) (point-min))
+    (insert (make-string length ?0))))
 
 (defun download-torrent (metainfo)
   ; (etorrent-log (format "Start downloading %s" (prin1-to-string metainfo)))
@@ -524,6 +558,10 @@
 	       (etorrent-log (format "Connected to %s failed." (car peers)))
 	       (try-make-network (cdr peers))))))
 
+      (defun get-total-n-blocks (file-length n-pieces n-blocks piece-length block-length)
+	(let ((last-piece-length (- file-length (* (- n-pieces 1) piece-length))))
+	  (+ (* n-blocks (- n-pieces 1)) (ceiling last-piece-length block-length))))
+
       (let ((proc (try-make-network peer-list))
 	    (download-attribute (make-hash-table :test 'equal)))
 
@@ -532,10 +570,16 @@
 	(puthash ":file-length" file-length download-attribute)
 	(puthash ":piece-length" piece-length download-attribute)
 	(puthash ":block-length" block-length download-attribute)
-	(puthash ":received" (make-vector n-pieces (make-bool-vector n-blocks nil)) download-attribute)
-	(puthash ":requested" (make-vector n-pieces (make-bool-vector n-blocks nil)) download-attribute)
-	(puthash ":block" (split-pieces piece-length block-length) download-attribute)
+	(puthash ":n-blocks" n-blocks download-attribute)
+	(puthash ":received"
+		 (make-bool-vector
+			          (get-total-n-blocks file-length n-pieces n-blocks piece-length block-length) nil)
+		 download-attribute)
+	(puthash ":requested"
+		 (make-bool-vector (get-total-n-blocks file-length n-pieces n-blocks piece-length block-length) nil)
+		 download-attribute)
 	(puthash ":queue" '() download-attribute)
+	; (fill-buffer (get-buffer-create file-name) file-length)
 
 	(puthash (process-get proc :name) download-attribute etorrent-download-proc-table)
 	(process-send-string (try-make-network peer-list) handshake-message)
